@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect } from 'react'
+import { useState } from 'react'
 import { supabase } from '../lib/supabase'
 import { useSubmitTransaction, useNameSuggestions } from '../hooks/useTransactions'
 
@@ -9,31 +9,68 @@ function now() {
 }
 
 export default function TransactionForm({ currentUser, onSuccess }) {
-  const [from, setFrom] = useState({ label: '', type: null, id: null })
-  const [to, setTo]     = useState({ label: '', type: null, id: null, external: null })
-  const [tag, setTag]   = useState('cash')
-  const [amount, setAmount] = useState('')
+  const [fromText, setFromText] = useState('')
+  const [toText, setToText]     = useState('')
+  const [fromPicked, setFromPicked] = useState(null)  // { type, id, label } or null
+  const [toPicked, setToPicked]     = useState(null)
+  const [tag, setTag]     = useState('cash')
+  const [amount, setAmount]   = useState('')
   const [datetime, setDatetime] = useState(now())
-  const [notes, setNotes] = useState('')
+  const [notes, setNotes]     = useState('')
   const [fromOpen, setFromOpen] = useState(false)
-  const [toOpen, setToOpen]     = useState(false)
-  const [error, setError] = useState('')
+  const [toOpen, setToOpen]   = useState(false)
+  const [error, setError]     = useState('')
   const [submitting, setSubmitting] = useState(false)
 
   const { data: suggestions } = useNameSuggestions()
-  const submitTxn = useSubmitTransaction()
 
-  const isExternalTo = to.type === 'external'
-  const tagForced = isExternalTo && tag === 'cash'
-  const canSubmit = from.type && to.type && amount && !tagForced && !submitting
+  // ── Resolve what FROM and TO actually are ──────────────────
+  function resolveFrom() {
+    const text = (fromPicked?.label || fromText).trim()
+    if (!text) return null
+    if (fromPicked) return fromPicked
 
-  function meOption(user) {
-    return { label: `Me (${user.name})`, type: 'me', id: user.id, isMe: true }
+    // Check known users
+    const me = currentUser
+    if (me && text.toLowerCase() === me.name?.toLowerCase())
+      return { type: 'me', id: me.id, label: text }
+
+    const matchUser = suggestions?.users?.find(u => u.name.toLowerCase() === text.toLowerCase())
+    if (matchUser) return { type: 'user', id: matchUser.id, label: text }
+
+    const matchClient = suggestions?.clients?.find(c => c.name.toLowerCase() === text.toLowerCase())
+    if (matchClient) return { type: 'client', id: matchClient.id, label: text }
+
+    // New client — will be created on submit
+    return { type: 'new_client', id: null, label: text }
   }
 
+  function resolveTo() {
+    const text = (toPicked?.label || toText).trim()
+    if (!text) return null
+    if (toPicked) return toPicked
+
+    const me = currentUser
+    if (me && text.toLowerCase() === me.name?.toLowerCase())
+      return { type: 'me', id: me.id, label: text }
+
+    const matchUser = suggestions?.users?.find(u => u.name.toLowerCase() === text.toLowerCase())
+    if (matchUser) return { type: 'user', id: matchUser.id, label: text }
+
+    // External party
+    return { type: 'external', id: null, label: text }
+  }
+
+  const resolvedFrom = resolveFrom()
+  const resolvedTo   = resolveTo()
+  const isExternalTo = resolvedTo?.type === 'external'
+  const tagForced    = isExternalTo && tag === 'cash'
+  const canSubmit    = resolvedFrom && resolvedTo && amount && tag && !tagForced && !submitting
+
+  // ── Suggestions lists ──────────────────────────────────────
   function fromSuggestions() {
     if (!suggestions) return []
-    const q = from.label.toLowerCase()
+    const q = fromText.toLowerCase()
     const items = [
       { label: `Me (${currentUser?.name || 'Me'})`, type: 'me', id: currentUser?.id, isMe: true },
       ...(suggestions.users || [])
@@ -42,63 +79,91 @@ export default function TransactionForm({ currentUser, onSuccess }) {
       ...(suggestions.clients || [])
         .map(c => ({ label: c.name, type: 'client', id: c.id })),
     ]
-    return q ? items.filter(i => i.label.toLowerCase().includes(q)) : items
+    if (!q) return items
+    const filtered = items.filter(i => i.label.toLowerCase().includes(q))
+    // If typed text doesn't match anything, show a "new client" hint
+    if (filtered.length === 0 && q.length > 1) {
+      return [{ label: fromText.trim(), type: 'new_client', id: null, isNew: true }]
+    }
+    return filtered
   }
 
   function toSuggestions() {
     if (!suggestions) return []
-    const q = to.label.toLowerCase()
+    const q = toText.toLowerCase()
     const items = [
       { label: `Me (${currentUser?.name || 'Me'})`, type: 'me', id: currentUser?.id, isMe: true },
       ...(suggestions.users || [])
         .filter(u => u.id !== currentUser?.id)
         .map(u => ({ label: u.name, type: 'user', id: u.id })),
       ...(suggestions.externals || [])
-        .map(e => ({ label: e, type: 'external', external: e })),
+        .map(e => ({ label: e, type: 'external' })),
     ]
-    return q ? items.filter(i => i.label.toLowerCase().includes(q)) : items
+    if (!q) return items
+    const filtered = items.filter(i => i.label.toLowerCase().includes(q))
+    if (filtered.length === 0 && q.length > 1) {
+      return [{ label: toText.trim(), type: 'external', isNew: true }]
+    }
+    return filtered
   }
 
+  // ── Pick handlers ──────────────────────────────────────────
   function pickFrom(item) {
-    setFrom({ label: item.label, type: item.type, id: item.id })
+    setFromText(item.label)
+    setFromPicked({ type: item.type, id: item.id || null, label: item.label })
     setFromOpen(false)
   }
 
   function pickTo(item) {
-    setTo({ label: item.label, type: item.type, id: item.id, external: item.external || null })
+    setToText(item.label)
+    setToPicked({ type: item.type, id: item.id || null, label: item.label })
     setToOpen(false)
     if (item.type === 'external' && tag === 'cash') setTag(null)
     if (item.type !== 'external' && !tag) setTag('cash')
   }
 
   function setMe() {
-    pickTo({ label: `Me (${currentUser?.name || 'Me'})`, type: 'me', id: currentUser?.id })
+    const label = `Me (${currentUser?.name || 'Me'})`
+    setToText(label)
+    setToPicked({ type: 'me', id: currentUser?.id, label })
   }
 
+  // ── Submit ─────────────────────────────────────────────────
   async function handleSubmit(e) {
     e.preventDefault()
     if (!canSubmit) return
     setError('')
     setSubmitting(true)
+
     try {
+      let fromClientId = resolvedFrom.type === 'client' ? resolvedFrom.id : null
+
+      // Auto-create new client if needed
+      if (resolvedFrom.type === 'new_client') {
+        const { data: newClient, error: clientErr } = await supabase
+          .from('clients')
+          .insert({ name: resolvedFrom.label, created_by: currentUser.id })
+          .select()
+          .single()
+        if (clientErr) throw clientErr
+        fromClientId = newClient.id
+      }
+
       const txn = {
         tag,
         amount: parseFloat(amount),
         transacted_at: new Date(datetime).toISOString(),
         logged_by: currentUser.id,
         notes: notes || null,
-        from_user_id: (from.type === 'me' || from.type === 'user') ? from.id : null,
-        from_client_id: from.type === 'client' ? from.id : null,
-        to_user_id: (to.type === 'me' || to.type === 'user') ? to.id : null,
-        to_external_name: to.type === 'external' ? to.label : null,
+        from_user_id: (resolvedFrom.type === 'me' || resolvedFrom.type === 'user') ? resolvedFrom.id : null,
+        from_client_id: fromClientId,
+        to_user_id: (resolvedTo.type === 'me' || resolvedTo.type === 'user') ? resolvedTo.id : null,
+        to_external_name: resolvedTo.type === 'external' ? resolvedTo.label : null,
       }
+
       await submitTxn.mutateAsync(txn)
-      setFrom({ label: '', type: null, id: null })
-      setTo({ label: '', type: null, id: null, external: null })
-      setTag('cash')
-      setAmount('')
-      setDatetime(now())
-      setNotes('')
+      setFromText(''); setToText(''); setFromPicked(null); setToPicked(null)
+      setTag('cash'); setAmount(''); setDatetime(now()); setNotes('')
       onSuccess?.()
     } catch (err) {
       setError(err.message || 'Failed to submit')
@@ -107,16 +172,25 @@ export default function TransactionForm({ currentUser, onSuccess }) {
     }
   }
 
+  const submitTxn = useSubmitTransaction()
+
+  const submitLabel = submitting ? 'Submitting...'
+    : !resolvedFrom ? 'Enter a From name to continue'
+    : !resolvedTo   ? 'Enter a To name to continue'
+    : tagForced     ? 'Select Conversion or Expense to continue'
+    : 'Submit Entry'
+
   return (
     <form onSubmit={handleSubmit} className="p-4 space-y-4">
+
       {/* FROM */}
       <div className="relative">
         <label className="block text-xs font-medium text-gray-400 uppercase tracking-wide mb-1.5">From</label>
         <input
           className="w-full px-3.5 py-2.5 rounded-xl border border-gray-200 text-sm focus:outline-none focus:ring-2 focus:ring-gray-800"
-          placeholder="Client or person..."
-          value={from.label}
-          onChange={e => { setFrom({ label: e.target.value, type: null, id: null }); setFromOpen(true) }}
+          placeholder="Client or person name..."
+          value={fromText}
+          onChange={e => { setFromText(e.target.value); setFromPicked(null); setFromOpen(true) }}
           onFocus={() => setFromOpen(true)}
           onBlur={() => setTimeout(() => setFromOpen(false), 150)}
         />
@@ -126,8 +200,11 @@ export default function TransactionForm({ currentUser, onSuccess }) {
               <button key={i} type="button" onMouseDown={() => pickFrom(item)}
                 className="w-full text-left px-3.5 py-2.5 text-sm hover:bg-gray-50 flex items-center gap-2 border-b border-gray-50 last:border-0">
                 {item.isMe && <span className="text-xs bg-gray-900 text-white px-1.5 py-0.5 rounded-full">Me</span>}
+                {item.isNew && <span className="text-xs bg-blue-100 text-blue-700 px-1.5 py-0.5 rounded-full">New client</span>}
                 <span>{item.label}</span>
-                <span className="ml-auto text-xs text-gray-400">{item.type === 'client' ? 'Client' : item.type === 'user' ? 'Team' : ''}</span>
+                <span className="ml-auto text-xs text-gray-400">
+                  {item.type === 'client' ? 'Client' : item.type === 'user' ? 'Team' : ''}
+                </span>
               </button>
             ))}
           </div>
@@ -142,8 +219,8 @@ export default function TransactionForm({ currentUser, onSuccess }) {
             <input
               className="w-full px-3.5 py-2.5 rounded-xl border border-gray-200 text-sm focus:outline-none focus:ring-2 focus:ring-gray-800"
               placeholder="Holder, collector, or party..."
-              value={to.label}
-              onChange={e => { setTo({ label: e.target.value, type: null, id: null }); setToOpen(true) }}
+              value={toText}
+              onChange={e => { setToText(e.target.value); setToPicked(null); setToOpen(true) }}
               onFocus={() => setToOpen(true)}
               onBlur={() => setTimeout(() => setToOpen(false), 150)}
             />
@@ -153,8 +230,11 @@ export default function TransactionForm({ currentUser, onSuccess }) {
                   <button key={i} type="button" onMouseDown={() => pickTo(item)}
                     className="w-full text-left px-3.5 py-2.5 text-sm hover:bg-gray-50 flex items-center gap-2 border-b border-gray-50 last:border-0">
                     {item.isMe && <span className="text-xs bg-gray-900 text-white px-1.5 py-0.5 rounded-full">Me</span>}
+                    {item.isNew && <span className="text-xs bg-orange-100 text-orange-700 px-1.5 py-0.5 rounded-full">External</span>}
                     <span>{item.label}</span>
-                    <span className="ml-auto text-xs text-gray-400">{item.type === 'external' ? 'External' : item.type === 'user' ? 'Team' : ''}</span>
+                    <span className="ml-auto text-xs text-gray-400">
+                      {item.type === 'external' && !item.isNew ? 'External' : item.type === 'user' ? 'Team' : ''}
+                    </span>
                   </button>
                 ))}
               </div>
@@ -168,7 +248,7 @@ export default function TransactionForm({ currentUser, onSuccess }) {
         {isExternalTo && (
           <p className="text-xs text-orange-600 mt-1.5">External party — select Conversion or Expense to continue</p>
         )}
-        {to.type === 'me' && (
+        {resolvedTo?.type === 'me' && (
           <p className="text-xs text-gray-400 mt-1.5">Cash stays with you (pending handover)</p>
         )}
       </div>
@@ -201,7 +281,7 @@ export default function TransactionForm({ currentUser, onSuccess }) {
       {/* AMOUNT */}
       <div>
         <label className="block text-xs font-medium text-gray-400 uppercase tracking-wide mb-1.5">Amount (₹)</label>
-        <input type="number" min="1" step="any" required
+        <input type="number" min="1" step="any"
           className="w-full px-3.5 py-2.5 rounded-xl border border-gray-200 text-sm focus:outline-none focus:ring-2 focus:ring-gray-800"
           placeholder="0.00" value={amount} onChange={e => setAmount(e.target.value)} />
       </div>
@@ -209,7 +289,7 @@ export default function TransactionForm({ currentUser, onSuccess }) {
       {/* DATE */}
       <div>
         <label className="block text-xs font-medium text-gray-400 uppercase tracking-wide mb-1.5">Date & Time</label>
-        <input type="datetime-local" required
+        <input type="datetime-local"
           className="w-full px-3.5 py-2.5 rounded-xl border border-gray-200 text-sm focus:outline-none focus:ring-2 focus:ring-gray-800"
           value={datetime} onChange={e => setDatetime(e.target.value)} />
       </div>
@@ -229,7 +309,7 @@ export default function TransactionForm({ currentUser, onSuccess }) {
 
       <button type="submit" disabled={!canSubmit}
         className="w-full bg-gray-900 text-white py-3 rounded-xl text-sm font-medium disabled:opacity-40 disabled:cursor-not-allowed hover:bg-gray-800 transition-colors">
-        {submitting ? 'Submitting...' : !from.type || !to.type ? 'Fill in From and To to continue' : tagForced ? 'Select a tag to continue' : 'Submit Entry'}
+        {submitLabel}
       </button>
     </form>
   )
